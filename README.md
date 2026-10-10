@@ -92,5 +92,5 @@ V. Elenhaupt and vjdhama. Their history is in this repository's git log.
 
 ## License
 
-Not yet settled: toml.cr has no license file. This port will take the
-license its authors give it.
+MIT, see [LICENSE](LICENSE). toml.cr, which this is ported from and which
+is kept in `archive/crystal/`, has no license file of its own.
