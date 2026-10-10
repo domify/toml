@@ -1,0 +1,1178 @@
+# TOML for iyi, ported from the Crystal shard crystal-community/toml.cr
+# 0.8.1, which reads TOML v0.5.0; the Crystal code is kept in
+# archive/crystal/.
+#
+#     toml = TOML.parse(%(title = "TOML Example"\n[owner]\nname = "Lance"\n))
+#     toml["title"].as_s           # => "TOML Example"
+#     toml["owner"]["name"].as_s   # => "Lance"
+#
+# `TOML.parse` answers a `TOML::Table`, a `Hash(String, TOML::Any)`; a
+# `TOML::Any` holds a Bool, Int64, Float64, String, Time, array or table.
+# Invalid TOML stops the program: `raise "TOML: … at line:column"`.
+#
+# Differences from the Crystal original:
+#   * Input is a `String`; there is no `IO` overload and no `parse_file`.
+#   * iyi's `Time` is UTC only: a local date-time is read as UTC, and a local
+#     time as that time of the current UTC day.
+#   * `\uXXXX` takes four hex digits and `\UXXXXXXXX` eight; the original
+#     read `\u` with up to eight and refused `\U`.
+#   * `TOML.quote` writes a basic string that `TOML.parse` reads back.
+#   * `TOML::Any` has no `dig`, `as_f32`, `dup` or `clone`, and other values
+#     do not compare equal to it.
+module toml
+
+import std/indexable
+import std/text
+import std/time::{Time}
+
+# Main entry point for TOML parsing.
+pub struct TOML
+  # A TOML Table. Just a convenience alias.
+  alias Table = Hash(String, TOML::Any)
+
+  # Parses a string.
+  def self.parse(input : String) : Table
+    Parser.new(input).parse
+  end
+
+  # A TOML basic string, "...", that `TOML.parse` reads back as *value*.
+  def self.quote(value : String) : String
+    String.build do |io|
+      io << '"'
+      value.each_char do |c|
+        case c
+        when '"'  then io << "\\\""
+        when '\\' then io << "\\\\"
+        when '\n' then io << "\\n"
+        when '\r' then io << "\\r"
+        when '\t' then io << "\\t"
+        else
+          if c.ord < 0x20 || c.ord == 0x7f
+            io << "\\u" << c.ord.to_s(16).rjust(4, '0')
+          else
+            io << c
+          end
+        end
+      end
+      io << '"'
+    end
+  end
+
+  # `TOML::Any` is a wrapper around all possible TOML types
+  # (`TOML::Any::Type`), for traversing dynamic or unknown TOML structures.
+  #
+  #     obj = TOML.parse(%([access]\nname = "any"\n))
+  #     obj["access"]["name"].as_s  # => "any"
+  #
+  # `#[]` and `#[]?` always return a `TOML::Any`, to allow further traversal.
+  # The `as_` methods, such as `#as_s` and `#as_i`, check the type of the
+  # underlying value and stop the program when it is another; the value is
+  # not converted. Their nil-able variants (`#as_i?`, `#as_s?`, …) return
+  # `nil` instead.
+  pub struct Any
+    # All possible TOML types.
+    alias Type = Bool | Int64 | Float64 | String | Time | Array(TOML::Any) | Hash(String, TOML::Any)
+
+    # Returns the raw underlying value.
+    getter raw : Type
+
+    @static_array : Bool
+
+    # Creates a `TOML::Any` that wraps the given value.
+    def initialize(@raw : Type)
+      @static_array = false
+    end
+
+    # An array written as a value, `key = [...]`, which a later `[[key]]`
+    # may not extend.
+    def static_array? : Bool
+      @static_array
+    end
+
+    def static_array=(value : Bool) : Bool
+      @static_array = value
+    end
+
+    def self.new(raw : Int32) : TOML::Any
+      new(raw.to_i64)
+    end
+
+    # The kind of value, in TOML's words: `bool`, `integer`, `float`,
+    # `string`, `datetime`, `array` or `table`.
+    def kind : String
+      case @raw
+      when Bool    then "bool"
+      when Int64   then "integer"
+      when Float64 then "float"
+      when String  then "string"
+      when Time    then "datetime"
+      when Array   then "array"
+      else              "table"
+      end
+    end
+
+    # Assumes the underlying value is an `Array` or `Hash` and returns its
+    # size.
+    def size : Int32
+      case object = @raw
+      when Array(TOML::Any)        then object.size
+      when Hash(String, TOML::Any) then object.size
+      else
+        raise "Expected Array or Hash for #size, not #{kind}"
+      end
+    end
+
+    def [](index : Int32) : TOML::Any
+      array = as_a?
+      raise "Expected Array for #[](index : Int), not #{kind}" unless array
+      array[index]
+    end
+
+    def []?(index : Int32) : TOML::Any?
+      array = as_a?
+      raise "Expected Array for #[]?(index : Int), not #{kind}" unless array
+      array[index]?
+    end
+
+    def [](key : String) : TOML::Any
+      hash = as_h?
+      raise "Expected Hash for #[](key : String), not #{kind}" unless hash
+      hash[key]
+    end
+
+    def []?(key : String) : TOML::Any?
+      hash = as_h?
+      raise "Expected Hash for #[]?(key : String), not #{kind}" unless hash
+      hash[key]?
+    end
+
+    def as_bool : Bool
+      value = as_bool?
+      raise "as_bool of a TOML #{kind}" if value.nil?
+      value
+    end
+
+    def as_bool? : Bool?
+      case r = @raw
+      when Bool then r
+      else           nil
+      end
+    end
+
+    def as_i : Int32
+      as_i64.to_i32
+    end
+
+    def as_i? : Int32?
+      value = as_i64?
+      value ? value.to_i32 : nil
+    end
+
+    def as_i64 : Int64
+      as_i64? || raise "as_i64 of a TOML #{kind}"
+    end
+
+    def as_i64? : Int64?
+      case r = @raw
+      when Int64 then r
+      else            nil
+      end
+    end
+
+    # A float, or an integer read as one.
+    def as_f : Float64
+      as_f? || raise "as_f of a TOML #{kind}"
+    end
+
+    def as_f? : Float64?
+      case r = @raw
+      when Int64   then r.to_f64
+      when Float64 then r
+      else              nil
+      end
+    end
+
+    def as_s : String
+      as_s? || raise "as_s of a TOML #{kind}"
+    end
+
+    def as_s? : String?
+      case r = @raw
+      when String then r
+      else             nil
+      end
+    end
+
+    def as_a : Array(TOML::Any)
+      as_a? || raise "as_a of a TOML #{kind}"
+    end
+
+    def as_a? : Array(TOML::Any)?
+      case r = @raw
+      when Array(TOML::Any) then r
+      else                       nil
+      end
+    end
+
+    def as_h : Hash(String, TOML::Any)
+      as_h? || raise "as_h of a TOML #{kind}"
+    end
+
+    def as_h? : Hash(String, TOML::Any)?
+      case r = @raw
+      when Hash(String, TOML::Any) then r
+      else                              nil
+      end
+    end
+
+    def to_s : String
+      @raw.to_s
+    end
+
+    def ==(other : TOML::Any) : Bool
+      raw == other.raw
+    end
+  end
+end
+
+class Token
+  property type : String
+  property string_value : String
+  property int_value : Int64
+  property float_value : Float64
+  property time_value : Time
+  property line_number : Int32
+  property column_number : Int32
+
+  def initialize
+    @type = "EOF"
+    @line_number = 0
+    @column_number = 0
+    @string_value = ""
+    @int_value = 0_i64
+    @float_value = 0.0
+    @time_value = Time.utc
+  end
+
+  def to_s : String
+    case @type
+    when "KEY"    then @string_value
+    when "STRING" then @string_value.inspect
+    when "INT"    then @int_value.to_s
+    when "FLOAT"  then @float_value.to_s
+    else               @type
+    end
+  end
+end
+
+class Lexer
+  getter token : Token
+  @chars : Array(Char)
+
+  def initialize(string : String)
+    @chars = string.chars
+    @chars << '\0'
+    @pos = 0
+    @token = Token.new
+    @line_number = 1
+    @column_number = 1
+    @before_eq_symbol = true
+  end
+
+  def next_token : Token
+    skip_whitespace
+    skip_comment
+
+    @token.line_number = @line_number
+    @token.column_number = @column_number
+
+    case current_char
+    when '\0'
+      @token.type = "EOF"
+    when '\r'
+      if next_char == '\n'
+        consume_newline
+      else
+        raise "expected '\\n' after '\\r'"
+      end
+    when '\n'
+      consume_newline
+    when '['
+      next_char "["
+    when ']'
+      next_char "]"
+    when '{'
+      next_char "{"
+    when '}'
+      next_char "}"
+    when '.'
+      next_char "."
+    when ','
+      next_char ","
+    when '='
+      @before_eq_symbol = false
+      next_char "="
+    when '0'
+      consume_number(false, true)
+    when '1'..'9'
+      consume_number(false, false)
+    when '+'
+      next_char
+      case current_char
+      when '0'..'9'
+        consume_number(false, false)
+      when 'a'..'z'
+        consume_math_constant(false)
+      else
+        unexpected_char
+      end
+    when '-'
+      case next_char
+      when '0'..'9'
+        consume_number(true, false)
+      when 'a'..'z'
+        consume_math_constant(true)
+      else
+        unexpected_char
+      end
+    when '"'
+      consume_string
+    when '\''
+      consume_literal_string
+    else
+      if key_part?(current_char)
+        consume_key
+      else
+        unexpected_char
+      end
+    end
+
+    @token
+  end
+
+  private def consume_newline : Nil
+    @line_number += 1
+    @column_number = 0
+    loop do
+      case next_char
+      when '\r'
+        raise "expected '\\n' after '\\r'" unless next_char == '\n'
+      when '\n'
+        # Nothing
+      else
+        break
+      end
+      @line_number += 1
+      @column_number = 0
+      @before_eq_symbol = true
+    end
+    @token.line_number = @line_number
+    @token.column_number = @column_number
+    @token.type = "NEWLINE"
+  end
+
+  private def consume_string : Nil
+    @token.type = "STRING"
+
+    if next_char == '"'
+      if next_char == '"'
+        consume_multiline_basic_string
+      else
+        @token.string_value = ""
+      end
+      return
+    end
+
+    consume_basic_string
+  end
+
+  private def consume_basic_string : Nil
+    @token.string_value = String.build do |io|
+      loop do
+        case current_char
+        when '"'
+          next_char
+          break
+        when '\\'
+          next_char
+          consume_escape(io)
+        when '\0'
+          raise "unterminated string literal"
+        when '\n'
+          raise "newline is not allowed in basic string"
+        else
+          io << current_char
+          next_char
+        end
+      end
+    end
+  end
+
+  private def consume_multiline_basic_string : Nil
+    if next_char == '\n'
+      newline
+      next_char
+    end
+
+    @token.string_value = String.build do |io|
+      loop do
+        case current_char
+        when '"'
+          if next_char == '"'
+            if next_char == '"'
+              next_char
+              break
+            else
+              io << "\"\""
+            end
+          else
+            io << '"'
+          end
+          next_char
+        when '\\'
+          if next_char == '\n'
+            newline
+            next_char
+            loop do
+              case current_char
+              when ' ', '\t'
+                next_char
+              when '\n'
+                newline
+                next_char
+              else
+                break
+              end
+            end
+          else
+            consume_escape(io)
+          end
+        when '\n'
+          newline
+          io << '\n'
+          next_char
+        when '\0'
+          raise "unterminated string literal"
+        else
+          io << current_char
+          next_char
+        end
+      end
+    end
+  end
+
+  private def consume_literal_string : Nil
+    @token.type = "STRING"
+
+    next_char
+
+    if current_char == '\''
+      if next_char == '\''
+        consume_multiline_literal_string
+      else
+        @token.string_value = ""
+      end
+    else
+      consume_basic_literal_string
+    end
+  end
+
+  private def consume_basic_literal_string : Nil
+    @token.string_value = String.build do |io|
+      io << current_char
+      loop do
+        case next_char
+        when '\''
+          next_char
+          break
+        when '\0'
+          raise "unterminated string literal"
+        else
+          io << current_char
+        end
+      end
+    end
+  end
+
+  private def consume_multiline_literal_string : Nil
+    if next_char == '\n'
+      newline
+      next_char
+    end
+
+    @token.string_value = String.build do |io|
+      loop do
+        case current_char
+        when '\''
+          if next_char == '\''
+            if next_char == '\''
+              next_char
+              break
+            else
+              io << "''"
+            end
+          else
+            io << '\''
+            io << current_char
+          end
+        when '\n'
+          newline
+          io << '\n'
+        when '\0'
+          raise "unterminated string literal"
+        else
+          io << current_char
+        end
+        next_char
+      end
+    end
+  end
+
+  private def consume_escape(io : String::Builder) : Nil
+    case current_char
+    when 'b'
+      io << '\b'
+    when 't'
+      io << '\t'
+    when 'n'
+      io << '\n'
+    when 'f'
+      io << '\f'
+    when 'r'
+      io << '\r'
+    when 'u'
+      io << consume_unicode_scalar(4)
+      return
+    when 'U'
+      io << consume_unicode_scalar(8)
+      return
+    when '\\', '\'', '"'
+      io << current_char
+    else
+      raise "unknown escape: \\#{current_char}"
+    end
+
+    next_char
+  end
+
+  private def consume_unicode_scalar(digits : Int32) : Char
+    value = 0
+    digits.times do
+      value = value * 16 + (next_char.to_i?(16) || raise "expecting hexadecimal number")
+    end
+    next_char
+    raise "invalid unicode scalar" if value > 0x10FFFF || (0xD800 <= value && value <= 0xDFFF)
+    value.chr
+  end
+
+  private def skip_whitespace : Nil
+    while current_char == ' ' || current_char == '\t'
+      next_char
+    end
+  end
+
+  private def skip_comment : Nil
+    if current_char == '#'
+      loop do
+        case next_char
+        when '\0', '\n'
+          break
+        end
+      end
+    end
+  end
+
+  private def consume_math_constant(negative : Bool) : Nil
+    string = String.build do |io|
+      while 'a' <= current_char && current_char <= 'z'
+        io << current_char
+        next_char
+      end
+    end
+    process_math_constant(string)
+
+    @token.float_value = -@token.float_value if negative
+  end
+
+  private def process_math_constant(string : String) : Nil
+    case string
+    when "inf"
+      @token.type = "FLOAT"
+      @token.float_value = 1.0 / 0.0
+    when "nan"
+      @token.type = "FLOAT"
+      @token.float_value = 0.0 / 0.0
+    else
+      raise "unexpected math constant #{string}"
+    end
+  end
+
+  private def consume_number(negative : Bool, leading_zero : Bool) : Nil
+    num = 0_i64
+    num += digit(current_char)
+    count = 1
+    last_is_underscore = false
+    has_underscore = false
+
+    loop do
+      case next_char
+      when '0'..'9'
+        num = num * 10 + digit(current_char)
+        last_is_underscore = false
+        count += 1
+      when '_'
+        raise "double underscores in a number are not allowed" if last_is_underscore
+        last_is_underscore = true
+        has_underscore = true
+      else
+        break
+      end
+    end
+
+    unless @before_eq_symbol
+      case current_char
+      when '-'
+        return consume_datetime(num) if count == 4 && !has_underscore && !negative
+        unexpected_char
+      when '.'
+        return consume_float(negative, num)
+      when ':'
+        return consume_time(num) if count == 2 && !has_underscore && !negative
+        unexpected_char
+      when 'e', 'E'
+        return consume_exponent(negative, num.to_f64)
+      end
+    end
+
+    raise "numbers with leading zero are not allowed" if leading_zero && num != 0
+
+    num *= -1 if negative
+
+    @token.type = "INT"
+    @token.int_value = num
+  end
+
+  private def consume_float(negative : Bool, integer : Int64) : Nil
+    divisor = 1_u64
+    last_is_underscore = false
+    next_char
+    loop do
+      case current_char
+      when '0'..'9'
+        integer *= 10
+        integer += digit(current_char)
+        divisor *= 10
+        next_char
+        last_is_underscore = false
+      when '_'
+        raise "double underscores in a number are not allowed" if last_is_underscore
+        last_is_underscore = true
+        next_char
+      else
+        break
+      end
+    end
+
+    raise "expecting float decimal digit" if divisor == 1
+
+    float = integer.to_f64 / divisor.to_f64
+
+    case current_char
+    when 'e', 'E'
+      consume_exponent(negative, float)
+    else
+      @token.type = "FLOAT"
+      @token.float_value = negative ? -float : float
+    end
+  end
+
+  private def consume_exponent(negative : Bool, float : Float64) : Nil
+    exponent = 0
+    negative_exponent = false
+    last_is_underscore = false
+
+    case next_char
+    when '+'
+      next_char
+    when '-'
+      next_char
+      negative_exponent = true
+    end
+
+    if '0' <= current_char && current_char <= '9'
+      loop do
+        case current_char
+        when '0'..'9'
+          exponent = exponent * 10 + digit(current_char)
+          next_char
+          last_is_underscore = false
+        when '_'
+          raise "double underscores in a number are not allowed" if last_is_underscore
+          last_is_underscore = true
+          next_char
+        else
+          break
+        end
+      end
+    else
+      unexpected_char
+    end
+
+    @token.type = "FLOAT"
+
+    exponent = -exponent if negative_exponent
+    float *= 10_f64 ** exponent
+    @token.float_value = negative ? -float : float
+  end
+
+  private def consume_time(hour : Int64) : Nil
+    minute = consume_datetime_component(2, "expected minute digit")
+    raise "expected ':'" unless next_char == ':'
+    second = consume_datetime_component(2, "expected second digit")
+
+    microseconds = 0
+    if next_char == '.'
+      microseconds = consume_datetime_component(6, "expected microsecond digit")
+      next_char
+    end
+
+    today = Time.utc
+    @token.type = "TIME"
+    @token.time_value = Time.utc(today.year, today.month, today.day, hour.to_i32, minute, second, nanosecond: microseconds * 1000)
+  end
+
+  private def consume_datetime(year : Int64) : Nil
+    t_delimiter_with_space = false
+
+    month = consume_datetime_component(2, "expected month digit")
+    raise "expected '-'" unless next_char == '-'
+    day = consume_datetime_component(2, "expected day digit")
+    case next_char
+    when 'T'
+    when ' '
+      t_delimiter_with_space = true
+    else
+      @token.type = "TIME"
+      @token.time_value = Time.utc(year.to_i32, month, day)
+      return
+    end
+    if t_delimiter_with_space && peek_next_char.to_i?.nil?
+      @token.type = "TIME"
+      @token.time_value = Time.utc(year.to_i32, month, day)
+      return
+    end
+    hour = consume_datetime_component(2, "expected hour digit")
+    raise "expected ':'" unless next_char == ':'
+    minute = consume_datetime_component(2, "expected minute digit")
+    raise "expected ':'" unless next_char == ':'
+    second = consume_datetime_component(2, "expected second digit")
+
+    microseconds = 0
+    if next_char == '.'
+      microseconds = consume_datetime_component(6, "expected microsecond digit")
+      next_char
+    end
+
+    time = Time.utc(year.to_i32, month, day, hour, minute, second, nanosecond: microseconds * 1000)
+    case current_char
+    when 'Z'
+      next_char
+    when '+', '-'
+      negative = current_char == '-'
+      hour_offset = consume_datetime_component(2, "expected hour offset digit")
+      raise "expected ':'" unless next_char == ':'
+      minute_offset = consume_datetime_component(2, "expected minute offset digit")
+      next_char
+      offset = Time::Span.hours(hour_offset.to_i64) + Time::Span.minutes(minute_offset.to_i64)
+      time = negative ? time + offset : time - offset
+    end
+
+    @token.type = "TIME"
+    @token.time_value = time
+  end
+
+  private def consume_datetime_component(length : Int32, error_msg : String) : Int32
+    value = 0
+    length.times do
+      value = 10 * value + (next_char.to_i? || raise error_msg)
+    end
+    value
+  end
+
+  private def consume_key : Nil
+    @token.string_value = String.build do |io|
+      io << current_char
+      while key_part?(next_char)
+        io << current_char
+      end
+    end
+    @token.type = "KEY"
+
+    # A key after `=` that is a math constant is a float.
+    if !@before_eq_symbol && (@token.string_value == "inf" || @token.string_value == "nan")
+      process_math_constant(@token.string_value)
+    end
+  end
+
+  private def key_part?(char : Char) : Bool
+    char.ascii_alphanumeric? || char == '_' || char == '-'
+  end
+
+  private def digit(char : Char) : Int32
+    char.ord - '0'.ord
+  end
+
+  private def current_char : Char
+    @chars[@pos]
+  end
+
+  private def peek_next_char : Char
+    @pos + 1 < @chars.size ? @chars[@pos + 1] : '\0'
+  end
+
+  private def next_char : Char
+    @column_number += 1
+    @pos += 1 if @pos < @chars.size - 1
+    current_char
+  end
+
+  private def next_char(token_type : String) : Char
+    @token.type = token_type
+    next_char
+  end
+
+  private def newline : Nil
+    @line_number += 1
+    @column_number = 0
+    @token.line_number = @line_number
+    @token.column_number = @column_number
+  end
+
+  private def unexpected_char : NoReturn
+    raise "unexpected char '#{current_char}'"
+  end
+
+  private def raise(msg : String) : NoReturn
+    ::raise "TOML: #{msg} at #{@line_number}:#{@column_number}"
+  end
+end
+
+class Parser
+  @names : Array(String)
+
+  def initialize(string : String)
+    @lexer = Lexer.new(string)
+    @names = [] of String
+    next_token
+  end
+
+  def parse : TOML::Table
+    root_table = TOML::Table.new
+    table = root_table
+
+    loop do
+      case token.type
+      when "EOF"
+        break
+      when "NEWLINE"
+        next_token
+      when "KEY", "INT", "STRING"
+        parse_key_value(table)
+        case token.type
+        when "NEWLINE"
+          next_token
+        when "EOF"
+          # Nothing
+        else
+          unexpected_token
+        end
+      when "["
+        table = parse_table_header(root_table)
+      else
+        unexpected_token
+      end
+    end
+
+    root_table
+  end
+
+  private def parse_key_value(root_table : TOML::Table) : Nil
+    table, key = parse_key(root_table) do |table, name, has_more_names|
+      handle_table(table, name, has_more_names)
+    end
+
+    check "="
+    next_token
+
+    raise "duplicated key: '#{key}'" if table.has_key?(key)
+
+    value = parse_value
+    value.static_array = value.as_a? != nil
+    table[key] = value
+  end
+
+  private def parse_key(table : TOML::Table, & : TOML::Table, String, Bool -> TOML::Table) : Tuple(TOML::Table, String)
+    @names.clear
+
+    loop do
+      case token.type
+      when "KEY", "STRING", "INT"
+        name = token.type == "INT" ? token.int_value.to_s : token.string_value
+        @names << name
+        next_token
+
+        has_more_names = token.type == "."
+        return {table, name} unless has_more_names
+
+        table = yield table, name, has_more_names
+
+        if token.type == "."
+          next_token
+          unexpected_token if token.type == "."
+        end
+      else
+        unexpected_token
+      end
+    end
+
+    unexpected_token
+  end
+
+  private def parse_value : TOML::Any
+    case token.type
+    when "KEY"
+      case token.string_value
+      when "true"
+        next_token
+        TOML::Any.new(true)
+      when "false"
+        next_token
+        TOML::Any.new(false)
+      else
+        unexpected_token
+      end
+    when "INT"
+      value = token.int_value
+      next_token
+      TOML::Any.new(value)
+    when "FLOAT"
+      value = token.float_value
+      next_token
+      TOML::Any.new(value)
+    when "STRING"
+      value = token.string_value
+      next_token
+      TOML::Any.new(value)
+    when "TIME"
+      value = token.time_value
+      next_token
+      TOML::Any.new(value)
+    when "["
+      TOML::Any.new(parse_array)
+    when "{"
+      TOML::Any.new(parse_inline_table)
+    else
+      unexpected_token
+    end
+  end
+
+  private def handle_table(table : TOML::Table, name : String, has_more_names : Bool) : TOML::Table
+    if existing_value = table[name]?
+      if raw = existing_value.as_h?
+        raise "table #{@names.join('.')} already defined" if !has_more_names && raw.empty?
+        return raw
+      elsif raw = existing_value.as_a?
+        raise "expected #{@names.join('.')} to be a Table, not #{existing_value}" unless has_more_names
+
+        if last_element = raw.last?
+          le_raw = last_element.as_h?
+          raise "expected #{@names.join('.')} to be a Table of Array, not #{existing_value}" unless le_raw
+          return le_raw
+        end
+        new_table = TOML::Table.new
+        raw << TOML::Any.new(new_table)
+        return new_table
+      end
+      raise "expected #{@names.join('.')} to be a Table, not #{existing_value}"
+    end
+
+    new_table = TOML::Table.new
+    table[name] = TOML::Any.new(new_table)
+    new_table
+  end
+
+  private def parse_table_header(root_table : TOML::Table) : TOML::Table
+    next_token
+
+    if token.type == "["
+      # Array of Tables
+      next_token
+      return parse_array_table_header(root_table)
+    end
+
+    # Table
+    parse_header(root_table, false) do |table, name, has_more_names|
+      existing = root_table[name]?
+      raise "Cannot append to static array" if existing && existing.static_array?
+      handle_table(table, name, has_more_names)
+    end
+  end
+
+  private def parse_array_table_header(root_table : TOML::Table) : TOML::Table
+    parse_header(root_table, true) do |table, name, has_more_names|
+      add_array_table(table, name, has_more_names)
+    end
+  end
+
+  private def add_array_table(table : TOML::Table, name : String, has_more_names : Bool) : TOML::Table
+    if existing_value = table[name]?
+      raise "Cannot append to static array" if existing_value.static_array?
+      if array = existing_value.as_a?
+        if array.empty? || !has_more_names
+          new_table = TOML::Table.new
+          array << TOML::Any.new(new_table)
+          return new_table
+        end
+        last = array.last.as_h?
+        raise "expected #{@names.join('.')} to be an Array of Table, not #{existing_value}" unless last
+        return last
+      elsif raw = existing_value.as_h?
+        raise "expected #{@names.join('.')} to be an Array, not #{existing_value}" unless has_more_names
+        return raw
+      end
+      raise "expected #{@names.join('.')} to be an Array, not #{existing_value}"
+    end
+
+    new_table = TOML::Table.new
+    if has_more_names
+      table[name] = TOML::Any.new(new_table)
+    else
+      table[name] = TOML::Any.new([TOML::Any.new(new_table)])
+    end
+    new_table
+  end
+
+  private def parse_header(table : TOML::Table, double_ending : Bool, & : TOML::Table, String, Bool -> TOML::Table) : TOML::Table
+    @names.clear
+
+    loop do
+      case token.type
+      when "KEY", "STRING", "INT"
+        name = token.type == "INT" ? token.int_value.to_s : token.string_value
+        @names << name
+        next_token
+
+        has_more_names = token.type == "."
+
+        table = yield table, name, has_more_names
+
+        case token.type
+        when "."
+          next_token
+          unexpected_token if token.type == "."
+        when "]"
+          next_token
+
+          if double_ending
+            check "]"
+            next_token
+          end
+
+          case token.type
+          when "EOF", "NEWLINE"
+            return table
+          else
+            unexpected_token
+          end
+        end
+      else
+        unexpected_token
+      end
+    end
+
+    unexpected_token
+  end
+
+  private def parse_array : Array(TOML::Any)
+    next_token
+
+    ary = [] of TOML::Any
+    previous_kind : String? = nil
+
+    loop do
+      case token.type
+      when "NEWLINE"
+        next_token
+      when "]"
+        next_token
+        break
+      else
+        new_value = parse_value
+        ary << new_value
+
+        raise "cannot mix types in array" if previous_kind && previous_kind != new_value.kind
+
+        previous_kind = new_value.kind
+
+        case token.type
+        when "NEWLINE"
+          next_token
+          check "]"
+          next_token
+          break
+        when ","
+          next_token
+        when "]"
+          next_token
+          break
+        else
+          raise "expected ',', ']' or newline, not #{token}"
+        end
+      end
+    end
+
+    ary
+  end
+
+  private def parse_inline_table : TOML::Table
+    next_token
+
+    table = TOML::Table.new
+    loop do
+      case token.type
+      when "KEY", "STRING", "INT"
+        parse_key_value(table)
+
+        next_token if token.type == ","
+
+        if token.type == "}"
+          next_token
+          break
+        end
+      else
+        unexpected_token
+      end
+    end
+    table
+  end
+
+  private def token : Token
+    @lexer.token
+  end
+
+  private def next_token : Token
+    @lexer.next_token
+  end
+
+  private def check(token_type : String) : Nil
+    raise "expecting token '#{token_type}', not '#{token}'" unless token_type == token.type
+  end
+
+  private def raise(msg : String) : NoReturn
+    ::raise "TOML: #{msg} at #{token.line_number}:#{token.column_number}"
+  end
+
+  private def unexpected_token : NoReturn
+    raise "unexpected token '#{token}'"
+  end
+end

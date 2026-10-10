@@ -1,0 +1,263 @@
+module toml_test
+
+# toml.cr's specs: spec/parser_spec.cr, spec/lexer_spec.cr (as values after
+# `a = `, since the lexer is not exported) and spec/cases_spec.cr, with the
+# cases under spec/. A local date-time is UTC here, as iyi's Time is; the
+# lexer's `\u` cases are `\U` ones, see the README. The cases after the
+# lexer's test what the port adds and fixes.
+
+import toml::{TOML}
+import std/dir::{Dir}
+import std/json::{JSON, Any}
+import std/time::{Time}
+
+FAILURES = [] of String
+
+def check(condition : Bool, message : String) : Nil
+  FAILURES << message unless condition
+end
+
+# A value as text that compares the way toml.cr's specs do: tables by key in
+# any order, integers apart from floats, a time as RFC 3339.
+def dump(value : TOML::Any) : String
+  case raw = value.raw
+  when String then raw.inspect
+  when Time   then (raw.nanosecond == 0 ? raw.to_rfc3339 : raw.to_rfc3339(6)).inspect
+  when Array(TOML::Any)
+    "[" + raw.map { |item| dump(item) }.join(",") + "]"
+  when Hash(String, TOML::Any)
+    "{" + raw.keys.sorted.map { |key| "#{key.inspect}:#{dump(raw[key])}" }.join(",") + "}"
+  else
+    raw.to_s
+  end
+end
+
+def dump(value : TOML::Table) : String
+  dump(TOML::Any.new(value))
+end
+
+# The same text for an expected value written as JSON.
+def dump_json(value : Any) : String
+  if array = value.as_a?
+    "[" + array.map { |item| dump_json(item) }.join(",") + "]"
+  elsif hash = value.as_h?
+    "{" + hash.keys.sorted.map { |key| "#{key.inspect}:#{dump_json(hash[key])}" }.join(",") + "}"
+  elsif string = value.as_s?
+    string.inspect
+  else
+    value.to_json
+  end
+end
+
+# The same text for a toml-test case: every value is {"type", "value"}.
+def dump_typed(value : Any) : String
+  if array = value.as_a?
+    return "[" + array.map { |item| dump_typed(item) }.join(",") + "]"
+  end
+  hash = value.as_h
+  if (type = hash["type"]?) && (typed = hash["value"]?) && hash.size == 2
+    case type.as_s
+    when "string"   then return typed.as_s.inspect
+    when "integer"  then return typed.as_s.to_i64.to_s
+    when "float"    then return typed.as_s.to_f.to_s
+    when "bool"     then return typed.as_s
+    when "datetime" then return typed.as_s.inspect
+    when "array"    then return dump_typed(typed)
+    end
+  end
+  "{" + hash.keys.sorted.map { |key| "#{key.inspect}:#{dump_typed(hash[key])}" }.join(",") + "}"
+end
+
+def it_parses(string : String, expected : String) : Nil
+  actual = dump(TOML.parse(string))
+  wanted = dump_json(JSON.parse(expected))
+  check(actual == wanted, "parses #{string.inspect}: #{actual}, not #{wanted}")
+end
+
+def it_parses_and_eq(string_a : String, string_b : String) : Nil
+  check(dump(TOML.parse(string_a)) == dump(TOML.parse(string_b)), "#{string_a.inspect} equals #{string_b.inspect}")
+end
+
+# Invalid TOML stops the program with "TOML: …"; a task catches it here.
+def refusal(string : String) : String?
+  message = nil
+  group do |g|
+    outcome = g.spawn { TOML.parse(string); 0 }.value
+    message = outcome.message.to_s if outcome.is_a?(Panicked)
+    0
+  end
+  message
+end
+
+def it_raises(string : String) : Nil
+  message = refusal(string)
+  check(!message.nil? && message.starts_with?("TOML: "), "raises on #{string.inspect}: #{message || "parsed"}")
+end
+
+today = Time.utc
+date = "#{today.year}-#{Time.pad2(today.month)}-#{Time.pad2(today.day)}"
+
+# spec/parser_spec.cr
+it_parses "", %({})
+it_parses "a = true", %({"a": true})
+it_parses "a = false", %({"a": false})
+it_parses "bare_key = false", %({"bare_key": false})
+it_parses "bare-key = false", %({"bare-key": false})
+it_parses "1234 = false", %({"1234": false})
+it_parses %("" = false), %({"": false})
+it_parses %('' = false), %({"": false})
+it_parses %("127.0.0.1" = "value"), %({"127.0.0.1": "value"})
+it_parses %("character encoding" = "value"), %({"character encoding": "value"})
+it_parses %("ʎǝʞ" = "value"), %({"ʎǝʞ": "value"})
+it_parses %('key2' = "value"), %({"key2": "value"})
+it_parses %('quoted "value"' = "value"), %({"quoted \\"value\\"": "value"})
+it_parses %(quoted = 'Tom "Dubs" Preston-Werner'), %({"quoted": "Tom \\"Dubs\\" Preston-Werner"})
+it_parses "\n    hello = true\n    world = false\n    ", %({"hello": true, "world": false})
+it_parses "\n    true = false\n    false = true\n    ", %({"true": false, "false": true})
+it_parses "a = 987_654", %({"a": 987654})
+it_parses "a = 1.0", %({"a": 1.0})
+infinities = TOML.parse("\n    a = inf\n    b = +inf\n    c = -inf\n    ")
+check(infinities["a"].as_f == 1.0 / 0.0 && infinities["b"].as_f == 1.0 / 0.0 && infinities["c"].as_f == -1.0 / 0.0, "parses inf")
+it_parses %(inf = 123), %({"inf": 123})
+it_parses %(nan = 123), %({"nan": 123})
+nans = TOML.parse("\n    a = nan\n    b = +nan\n    c = -nan\n    ")
+check(nans["a"].as_f.nan? && nans["b"].as_f.nan? && nans["c"].as_f.nan?, "parses nan")
+it_parses %(a = "hello"), %({"a": "hello"})
+it_parses "a = 1979-05-27T07:32:00Z", %({"a": "1979-05-27T07:32:00Z"})
+it_parses "a = 1979-05-27T00:32:00+07:00", %({"a": "1979-05-26T17:32:00Z"})
+it_parses "a = 1979-05-27T00:32:00.999999-07:00", %({"a": "1979-05-27T07:32:00.999999Z"})
+it_parses "a = 1979-05-27T00:32:00.999999", %({"a": "1979-05-27T00:32:00.999999Z"})
+it_parses "a = 1979-05-27 07:32:00Z", %({"a": "1979-05-27T07:32:00Z"})
+it_parses "a = 1979-05-27T00:32:00", %({"a": "1979-05-27T00:32:00Z"})
+it_parses "a = 1979-05-27", %({"a": "1979-05-27T00:00:00Z"})
+it_parses "a = 1979-05-27  # comment", %({"a": "1979-05-27T00:00:00Z"})
+it_parses "a = 00:32:00", %({"a": "#{date}T00:32:00Z"})
+it_parses "a = 00:32:00.999999", %({"a": "#{date}T00:32:00.999999Z"})
+it_parses %(a = [ [ 1, 2 ], ["a", "b", "c"] ]), %({"a": [[1, 2], ["a", "b", "c"]]})
+it_parses %(string_array = [ "all", 'strings', """are the same""", '''type''' ]), %({"string_array": ["all", "strings", "are the same", "type"]})
+it_parses "integers2 = [\n      1, 2, 3\n    ]", %({"integers2": [1, 2, 3]})
+it_parses "integers2 = [\n    1,\n    2,\n  ]", %({"integers2": [1, 2]})
+it_parses "a = [1, 2, 3]", %({"a": [1, 2, 3]})
+it_parses "a = [[[[]]]]", %({"a": [[[[]]]]})
+it_parses %(site."google.com" = true), %({"site": {"google.com": true}})
+it_parses %(3.14159 = "pi"), %({"3": {"14159": "pi"}})
+it_parses "\n    a = [\n      1, 2, 3\n    ]\n    ", %({"a": [1, 2, 3]})
+it_parses "\n    a = [\n      1,\n      2,\n      3,\n    ]\n    ", %({"a": [1, 2, 3]})
+it_parses "\n    [table]\n    one = 1\n    two = 2\n    ", %({"table": {"one": 1, "two": 2}})
+it_parses "\n    [table1]\n    one = 1\n\n    [table2]\n    two = 2\n    ", %({"table1": {"one": 1}, "table2": {"two": 2}})
+it_parses "\n      [dog.\"tater.man\"]\n      name = \"pug\"\n    ", %({"dog": {"tater.man": {"name": "pug"}}})
+it_parses "\n      [dog.\"tater.man\"]\n      type.name = \"pug\"\n    ", %({"dog": {"tater.man": {"type": {"name": "pug"}}}})
+it_parses "\n    [foo.bar.baz]\n    one = 1\n    ", %({"foo": {"bar": {"baz": {"one": 1}}}})
+it_parses "\n    [ foo . bar . baz ]\n    one = 1\n    ", %({"foo": {"bar": {"baz": {"one": 1}}}})
+it_parses "\n    [a.b]\n    c = 1\n\n    [a]\n    d = 2\n    ", %({"a": {"b": {"c": 1}, "d": 2}})
+it_parses "\n    point = { x = 1, y = 2 }\n    ", %({"point": {"x": 1, "y": 2}})
+it_parses %(animal = { type.name = "pug" }), %({"animal": {"type": {"name": "pug"}}})
+it_parses "\n    \"foo\" = 1\n    ", %({"foo": 1})
+it_parses "\n    [dog.\"tater.man\"]\n    type = \"pug\"\n    ", %({"dog": {"tater.man": {"type": "pug"}}})
+it_parses "\n    [foo]\n    ", %({"foo": {}})
+it_parses "\n    [[products]]\n    name = \"Hammer\"\n    sku = 738594937\n\n    [[products]]\n\n    [[products]]\n    name = \"Nail\"\n    sku = 284758393\n    color = \"gray\"\n    ",
+  %({"products": [{"name": "Hammer", "sku": 738594937}, {}, {"name": "Nail", "sku": 284758393, "color": "gray"}]})
+it_parses "\n    [[fruit]]\n    name = \"apple\"\n\n      [fruit.physical]\n        color = \"red\"\n        shape = \"round\"\n    ",
+  %({"fruit": [{"name": "apple", "physical": {"color": "red", "shape": "round"}}]})
+it_parses "\n    [[fruit.variety]]\n    name = \"red delicious\"\n    ", %({"fruit": {"variety": [{"name": "red delicious"}]}})
+it_parses "\n    [[fruit]]\n    name = \"apple\"\n\n      [[fruit.variety]]\n      name = \"red delicious\"\n    ",
+  %({"fruit": [{"name": "apple", "variety": [{"name": "red delicious"}]}]})
+it_parses "\n    [[fruit]]\n      name = \"apple\"\n\n      [fruit.physical]\n        color = \"red\"\n        shape = \"round\"\n\n      [[fruit.variety]]\n        name = \"red delicious\"\n\n      [[fruit.variety]]\n        name = \"granny smith\"\n\n    [[fruit]]\n      name = \"banana\"\n\n      [[fruit.variety]]\n        name = \"plantain\"\n    ",
+  %({"fruit": [{"name": "apple", "physical": {"color": "red", "shape": "round"}, "variety": [{"name": "red delicious"}, {"name": "granny smith"}]}, {"name": "banana", "variety": [{"name": "plantain"}]}]})
+it_parses_and_eq %(name = { first = "Tom", last = "Preston-Werner" }), "[name]\n      first = \"Tom\"\n      last = \"Preston-Werner\""
+it_parses_and_eq %(point = { x = 1, y = 2 }), "[point]\n      x = 1\n      y = 2"
+it_parses_and_eq %(animal = { type.name = "pug" }), "[animal]\n      type.name = \"pug\""
+it_raises %(a = [1, 2)
+it_raises %(a = [1,,2])
+it_raises "a = [1\n2]"
+it_raises %(point = { x = 1,, y = 2})
+it_raises %(point = { x = 1, )
+it_raises %([])
+it_raises %([a.])
+it_raises %([a..b])
+it_raises %([.b])
+it_raises %([.])
+it_raises %( = "no key name")
+it_raises "\n    [[fruit]]\n      name = \"apple\"\n\n      [[fruit.variety]]\n        name = \"red delicious\"\n\n      [fruit.variety]\n        name = \"granny smith\"\n    "
+it_raises "\n    [[fruit]]\n      name = \"apple\"\n\n      [fruit.variety]\n        name = \"granny smith\"\n\n      [[fruit.variety]]\n        name = \"red delicious\"\n    "
+it_raises "a = [1, false]"
+it_raises "a = [1, [2]]"
+it_raises "\n    a = 1\n    a = 2\n    "
+it_raises "\n    [a]\n    [a]\n    "
+it_raises "\n    [a]b]\n    zyx = 42\n  "
+
+# spec/lexer_spec.cr
+it_parses " # hello\n[a] # bye\nb = 1 # another", %({"a": {"b": 1}})
+it_parses "\r\n\r\na = 1\r\n", %({"a": 1})
+[{"0", "0"}, {"1", "1"}, {"123456789", "123456789"}, {"123_456_789", "123456789"}, {"-123_456_789", "-123456789"},
+ {"+123_456_789", "123456789"}, {"9223372036854775807", "9223372036854775807"}, {"-9223372036854775807", "-9223372036854775807"},
+ {"12.34", "12.34"}, {"0.123", "0.123"}, {"1234.567", "1234.567"}, {"0e1", "0.0"}, {"0E1", "0.0"}, {"0.1e1", "1.0"},
+ {"0e+12", "0.0"}, {"0e-12", "0.0"}, {"1e2", "100.0"}, {"1E2", "100.0"}, {"1e+12", "1000000000000.0"},
+ {"1.2e-3", "0.0012"}, {"9.91343313498688", "9.91343313498688"}, {"9.913_433_134_986_88", "9.91343313498688"},
+ {"1.2e-3_4", "1.2e-34"}].each do |pair|
+  it_parses "a = #{pair[0]}", %({"a": #{pair[1]}})
+end
+it_parses %(a = "hello"), %({"a": "hello"})
+it_parses %(a = "hi \\b\\t\\n\\f\\r\\"\\\\ there"), %({"a": "hi \\b\\t\\n\\f\\r\\"\\\\ there"})
+it_parses %(a = "hi \\u1234 there"), %({"a": "hi \\u1234 there"})
+it_parses %(a = "hi \\U00001234 there"), %({"a": "hi \\u1234 there"})
+it_parses %(a = ""), %({"a": ""})
+it_parses %(a = """hello"""), %({"a": "hello"})
+it_parses %(a = """\nhello"""), %({"a": "hello"})
+it_parses %(a = """\nhello\n  world\n"""), %({"a": "hello\\n  world\\n"})
+it_parses %(a = """hi \\b\\t\\n\\f\\r\\"\\\\ there"""), %({"a": "hi \\b\\t\\n\\f\\r\\"\\\\ there"})
+it_parses %(a = """\\\n  The quick brown \\\n  fox jumps over \\\n    the lazy dog."""), %({"a": "The quick brown fox jumps over the lazy dog."})
+it_parses %(a = """hello\\\n"""), %({"a": "hello"})
+it_parses %(a = 'hello'), %({"a": "hello"})
+it_parses %(a = 'C:\\Users\\nodejs\\templates'), %({"a": "C:\\\\Users\\\\nodejs\\\\templates"})
+it_parses %(a = '''hello'''), %({"a": "hello"})
+it_parses %(a = '''\nhello  \n  world'''), %({"a": "hello  \\n  world"})
+it_parses %(a = '''I don't need'''), %({"a": "I don't need"})
+it_parses "a = 1979-05-27T07:32:00-07:30", %({"a": "1979-05-27T15:02:00Z"})
+it_parses "a = 1979-05-27T07:32:00+07:30", %({"a": "1979-05-27T00:02:00Z"})
+it_parses "a = 1979-05-27T07:32:00.999999-07:00", %({"a": "1979-05-27T14:32:00.999999Z"})
+it_raises "a = 123__45"
+it_raises "a = 0123"
+it_raises %(a = "hello)
+it_raises %(a = "\\u1")
+it_raises %(a = "\\u12")
+it_raises %(a = "\\u123")
+it_raises %(a = "\\U1234567")
+it_raises "a = \"hello\nworld\""
+it_raises %(a = 1.)
+it_raises %(a = "\\xAg")
+
+# The port's additions and fixes.
+it_parses %(a = "\\u0001ab"), %({"a": "\\u0001ab"})
+it_parses %(a = "\\U0001F600"), %({"a": "😀"})
+it_raises %(a = "\\uD800")
+it_parses "a = 1979-05-27 # a date, then a space", %({"a": "1979-05-27T00:00:00Z"})
+tricky = "a \"b\" \\ c\nd\te\u0001\u007f é ↗ \u0001ab"
+check(TOML.quote(tricky) == %("a \\"b\\" \\\\ c\\nd\\te\\u0001\\u007f é ↗ \\u0001ab"), "quote: #{TOML.quote(tricky)}")
+check(TOML.parse("k = #{TOML.quote(tricky)}\n")["k"].as_s == tricky, "a quoted string reads back")
+any = TOML.parse(%(n = 1\nf = 1.5\nb = true\ns = "x"\na = [1]\nt = {k = 1}))
+check(any["n"].as_i == 1 && any["n"].as_f == 1.0 && any["f"].as_f == 1.5 && any["f"].as_i?.nil?, "as_i, as_f")
+check(any["b"].as_bool && any["s"].as_s == "x" && any["a"][0].as_i64 == 1 && any["a"].size == 1, "as_bool, as_s, [], size")
+check(any["t"]["k"].as_i == 1 && any["t"]["x"]?.nil? && any["a"][5]?.nil? && any["s"].as_a?.nil?, "[]?, as_a?")
+check(any["n"].kind == "integer" && any["t"].kind == "table" && any["a"] == TOML.parse("a = [1]")["a"], "kind, ==")
+check((refusal("a = 1\na = 2") || "") == "TOML: duplicated key: 'a' at 2:5", "refusal names line and column: #{refusal("a = 1\na = 2")}")
+
+# spec/cases_spec.cr
+valid = Dir.glob("spec/valid/**/*.toml").sorted
+valid.each do |file|
+  actual = dump(TOML.parse(File.read(file)))
+  wanted = dump_typed(JSON.parse(File.read(file[0, file.size - 5] + ".json")))
+  check(actual == wanted, "parses valid case #{file}: #{actual}, not #{wanted}")
+end
+invalid = Dir.glob("spec/invalid/**/*.toml").sorted
+invalid.each do |file|
+  message = refusal(File.read(file))
+  check(!message.nil? && message.starts_with?("TOML: "), "raises on invalid case #{file}: #{message || "parsed"}")
+end
+check(valid.size == 39 && invalid.size == 51, "every case is found: #{valid.size} valid, #{invalid.size} invalid")
+
+unless FAILURES.empty?
+  FAILURES.each { |failure| STDERR.puts "FAIL: #{failure}" }
+  raise "#{FAILURES.size} failed"
+end
+puts "PASS"
