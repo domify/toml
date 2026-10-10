@@ -7,8 +7,8 @@ This is a native iyi port of [toml.cr](https://github.com/crystal-community/toml
 the TOML parser for Crystal: its lexer, parser and `TOML::Any` at release
 0.8.1, and its tests. The Crystal code is kept unchanged in
 [`archive/crystal/`](archive/crystal/); toml.cr itself lives on at
-crystal-community. The iyi port is maintained by Priit Tark at
-[domify](https://github.com/domify).
+crystal-community. Priit Tark at [domify](https://github.com/domify)
+maintains the iyi port for now.
 
 ## Installation
 
@@ -89,6 +89,10 @@ and [kojix2](https://github.com/kojix2), maiha, Will Richardson,
 summer-alice, Andra Antariksa, Martin Verzilli, Brian J. Cardiff,
 James Taylor, Michael Fellinger, Stygmates, Tyler Gillies,
 V. Elenhaupt and vjdhama. Their history is in this repository's git log.
+
+I maintain this port for the time being. If one of toml.cr's authors would
+like to look after the iyi port, you are very welcome to take it over; open
+an issue.
 
 ## License
 
